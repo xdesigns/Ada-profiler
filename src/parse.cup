@@ -1,0 +1,2464 @@
+import java_cup.runtime.*;
+import java.lang.*;
+import java.util.*;
+import java.io.*;
+import java.util.Scanner;
+import java.awt.*;
+import java.awt.event.*;
+import javax.swing.*;
+import javax.swing.border.*;
+import javax.swing.event.*;
+import javax.swing.filechooser.*;
+
+
+action code{:
+	public static parser.AdaFrame frame;
+	
+	//OS dependent newline character. Used with writeBytes when writing to files
+	final static String nl=System.getProperty("line.seperator","\r\n");
+	
+	//OS dependent file seperator 
+	final static String fs=System.getProperty("file.seperator","\\");
+	
+	//Whether to delete the temporary files and compiled files created during the process
+	static boolean doCleanup=true;
+	
+	//Whether to save history files between executions
+	static boolean saveHistory=true;
+	
+	//The name of the current file w/o extension/proc/pkg that is being currently parsed
+	static String mainProc;
+	static String s_mainProc;
+
+	//Suffix added to the name of the main proc for temporary directory
+	static String tempDirSuffix="_temp";
+	
+	//For tree directory
+	static String treeDirSuffix="_tree";
+	
+	//For history directory
+	static String histDirSuffix="_history";
+	
+	//Prefix for the .ads and .adb include files created for each source file
+	static String tokenPkgPrefix="T_";
+	
+	//Count Files suffix
+	static String countFileSuffix="_counts.txt";
+	
+	//Tree File suffix
+	static String treeFileSuffix="_tree.html";
+	
+	//Variables that holds for the various dependent source files for a particular execution instance
+	static String tempDir;
+	static String treeDir;
+	static String histDir;
+	static String treeFile;
+
+	//Used to calculate total and execution times
+	static Date exStartDate;
+	static Date startDate;
+	static Date stopDate;
+	
+	//To format the nesting in tree files 
+	static int levelDisplayFactor=3;
+	static int levelDisplayOffset=0;
+	
+	//Variables holding the byte and line positions. Used by getInteger()
+	static int startByte,stopByte,startLine,stopLine;
+	static int startByte1,stopByte1,startLine1,stopLine1;
+	Stmt temp;
+	
+	//Gets the byte and line no from the value for terminals passed by the lexer
+	static void getInteger(Object a, int type){
+		String str=(String)a;
+		int index=str.indexOf('+');
+		int byteNo,line;
+		if (index<0){
+			byteNo=0;
+			line=0;
+		}
+		else{
+			byteNo=Integer.parseInt(str.substring(0,index));
+			line=Integer.parseInt(str.substring(index+1,str.length()));
+		}
+		switch(type){
+			case 0:	startByte=byteNo;
+					startLine=line;
+					break;
+			case 1:	stopByte=byteNo;
+					stopLine=line;
+					break;
+			case 2:	startByte1=byteNo;
+					startLine1=line;
+					break;
+			case 3:	stopByte1=byteNo;
+					stopLine1=line;
+					break;
+		}
+	}
+		
+	//Stores the location to call ada count file generation routines in the main proc	
+	static int funcLoc=-1;
+	
+	
+	static enum Type { CASE,CASE_H,WHEN_H,FOR,FOR_H,WHILE,WHILE_H,LOOP,LOOP_H,IF,IF_H,ELSIF_H,ELSE_H,BLOCK,FUNC_H,FUNC,PROC_H,PROC };
+	
+	//Used by parser
+	static FileReader fread;
+	//Used by getString() to extract portions of a source file and for writing to instrumented source file
+	static RandomAccessFile fr,fw;
+	
+	
+	static class Location implements Comparable{
+		public int startByte;
+		public int stopByte;
+		public int startLine;
+		public int stopLine;
+
+		Location(int startByte,int stopByte,int startLine,int stopLine){
+			this.startByte=startByte;
+			this.stopByte=stopByte;
+			this.startLine=startLine;
+			this.stopLine=stopLine;
+			
+		}
+
+		public int compareTo (Object a){
+			return new Integer(startByte).compareTo(new Integer(((Location)a).startByte));
+		}
+	}
+
+	
+	static class Stmt implements Comparable
+	{
+		public Location loc;
+		public Type type;
+		public String value;
+		public ArrayList<Stmt> headers;
+		public int level;
+		Stmt(Location loc,Type type,String value){
+			this.loc=new Location(loc.startByte,loc.stopByte,loc.startLine,loc.stopLine);
+			this.type=type;
+			this.value=value;
+			headers=new ArrayList<Stmt>();
+			level=0;
+		}
+		
+		public int compareTo (Object a){
+			return loc.compareTo(((Stmt)a).loc);
+		}
+	}
+	
+	static class Header implements Comparable{
+		public Stmt hdr;
+		public Type type;
+		public int i,j;
+		Header(Stmt hdr,Type type,int i,int j){
+			this.hdr=hdr;
+			this.type=type;
+			this.i=i;
+			this.j=j;
+		}
+		
+		public int compareTo(Object a){
+			return hdr.compareTo(((Header)a).hdr);
+		}
+	}
+
+	
+	static String getString(Location loc){
+		int startByte=loc.startByte;
+		int stopByte=loc.stopByte;
+		int length=stopByte-startByte;
+		
+		byte[] str=new byte[length];
+		try{
+			fr.seek(startByte);
+			fr.read(str,0,length);
+			fr.seek(0);
+		}catch(Exception e){
+			frame.status.append("[ERROR] In function getString() while reading input file\n");
+			threadExit(false);
+		}
+		
+		return new String(str);
+	}
+
+	//Used by each source file specific parsing
+	static ArrayList<Stmt> elePositions=new ArrayList<Stmt>();
+	static ArrayList<Header> headers=new ArrayList<Header>();
+	static ArrayList<String> depPkg=new ArrayList<String>();
+	
+	//All the source files that were processed
+	static ArrayList<String> pkgsSeen=new ArrayList<String>();
+	
+	//Saved elePositions and headers arraylists for all source files parsed
+	static ArrayList<ArrayList<Stmt>> elePositionsAll=new ArrayList<ArrayList<Stmt>>();
+	static ArrayList<ArrayList<Header>> headersAll=new ArrayList<ArrayList<Header>>();
+	
+	//To store previous counts of all dependent packages
+	static ArrayList<ArrayList<Integer>> countStore=new ArrayList<ArrayList<Integer>>();
+	
+	static void generateTokenFile(){
+		RandomAccessFile fit;
+		String tokenPkg=tokenPkgPrefix+mainProc;
+		String countFile=histDir+mainProc+countFileSuffix;
+		try{
+			//Create .ads file
+			String tokenAdsFile=histDir+tokenPkg+".ads";
+			frame.status.append("[INFO] Generating <"+tokenAdsFile+">\n");
+			fit=new RandomAccessFile(tokenAdsFile,"rw");
+			fit.setLength(0);
+
+			fit.writeBytes("package "+tokenPkg+" is"+nl);
+			//Declare all count variables and their type
+			for (int i=0;i<elePositions.size();++i){
+				Stmt ele=elePositions.get(i);
+				fit.writeBytes("\ttype counts_"+i+"_type is array(1.."+(ele.headers.size())+") of Integer;"+nl);
+				fit.writeBytes("\tcounts_"+i+":counts_"+i+"_type;"+nl);
+			}
+			//Procedure to write the counts to a count file
+			fit.writeBytes("\tprocedure create_count_file;"+nl);
+			fit.writeBytes("end "+tokenPkg+";");
+			fit.close();
+			
+			//Create .adb file
+			String tokenAdbFile=histDir+tokenPkg+".adb";
+			frame.status.append("[INFO] Generating <"+tokenAdbFile+">\n");
+			fit=new RandomAccessFile(tokenAdbFile,"rw");
+			fit.setLength(0);
+			
+			fit.writeBytes("with Ada.Text_IO; use Ada.Text_IO;"+nl);
+			fit.writeBytes("with Ada.Integer_Text_IO; use Ada.Integer_Text_IO;"+nl);
+			fit.writeBytes("package body "+tokenPkg+" is"+nl);
+			//Procedure definition
+			fit.writeBytes("\tprocedure create_count_file is"+nl);
+			fit.writeBytes("\t\tcount_file : File_Type;"+nl);
+			fit.writeBytes("\tbegin"+nl);
+			fit.writeBytes("\t\tCreate(count_file, Out_File, \""+countFile+"\");"+nl);
+			
+			for (int i=0;i<headers.size();++i){
+				Header hdr=headers.get(i);
+				fit.writeBytes("\t\tPut(count_file,counts_"+hdr.i+"("+hdr.j+"));"+nl);
+				//fit.writeBytes("\t\tNewline;"+nl);
+			}
+			
+			fit.writeBytes("\t\tClose(count_file);"+nl);
+			fit.writeBytes("\tend create_count_file;"+nl);
+			fit.writeBytes("end "+tokenPkg+";");
+			fit.close();
+	
+		}catch (IOException e){
+			frame.status.append("[ERROR] While generating Token files <"+tokenPkg+">\n");
+			threadExit(false);
+		}
+	}
+		
+	public static void generateCSSFile(){
+		String cssFile=treeDir+pkgsSeen.get(0)+".css";
+		frame.status.append("[INFO] Generating <"+cssFile+">\n");
+		try{
+			PrintStream ft=new PrintStream(cssFile);
+			
+			ft.printf("h1{\n");
+			ft.printf("\tfont-family:sans-serif;\n");
+			ft.printf("\tfont-size:200%%;\n");
+			ft.printf("\tfont-weight:bold;\n");
+			ft.printf("\ttext-align:center;\n");
+			ft.printf("\tmargin:5px\n");
+			ft.printf("}\n");
+			
+			ft.printf("table{\n");
+			ft.printf("\tborder-collapse:collapse;\n");
+			ft.printf("\tfont-family:sans-serif;\n");
+			ft.printf("\tfont-size:80%%;\n");
+			ft.printf("\twidth:100%%;\n");
+			ft.printf("\tmargin:10px 0px 10px 0px;\n");
+			ft.printf("}\n");
+			
+			ft.printf(".tr_hdr_main{\n");
+			ft.printf("\tbackground-color:#A63F59;\n");
+			ft.printf("\tcolor:#FFFFFF;\n");
+			ft.printf("\tfont-weight:bold;\n");
+			ft.printf("}\n");
+			
+			ft.printf(".tr_file{\n");
+			ft.printf("\tbackground-color:#A63F59;\n");
+			ft.printf("\tcolor:#FFFFFF;\n");
+			ft.printf("\tfont-weight:bold;\n");
+			ft.printf("}\n");
+			
+			ft.printf(".tr_hdr_file{\n");
+			ft.printf("\tbackground-color:#3F8FA6;\n");
+			ft.printf("\tcolor:#FFFFFF;\n");
+			ft.printf("\tfont-weight:bold;\n");
+			ft.printf("}\n");
+			
+			ft.printf(".tr_0{\n");
+			ft.printf("\tbackground-color:#FFFFFF;\n");
+			ft.printf("}\n");
+			
+			ft.printf(".tr_1{\n");
+			ft.printf("\tbackground-color:D1D1D1;\n");
+			ft.printf("}\n");
+
+			ft.close();
+		}catch (Exception e){
+			frame.status.append("[ERROR] While generating CSS file <"+cssFile+">\n");
+			threadExit(false);
+		}
+	}
+		
+	public static void generateTree(){
+		try{
+			Scanner fc;
+			ArrayList<Integer> prevCountList;
+			PrintStream ft=new PrintStream(treeFile);
+			int count,prevCount;
+			Header hdr;
+			int curLevel;
+			String level;
+			generateCSSFile();
+			ft.printf("<HTML>\n");
+			ft.printf("\t<HEAD>\n");
+				ft.printf("\t\t<TITLE>Analysis Result for %s</TITLE>\n",pkgsSeen.get(0));
+				ft.printf("\t\t<link rel='stylesheet' type='text/css' href='%s.css' />\n",pkgsSeen.get(0));
+			ft.printf("\t</HEAD>\n");
+			ft.printf("\t<BODY>\n");
+				ft.printf("\t\t<h1>Analysis Report</h1>\n");
+				ft.printf("\t\t<TABLE class='main_tab'>\n");
+
+					ft.printf("\t\t\t<TR class='tr_hdr_main'>\n");
+			
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\tMain Procedure\n");
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\tDate Started\n");
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\tDate Ended\n");
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\tExecution Time\n");
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\tTotal Time\n");
+						ft.printf("\t\t\t\t</TD>\n");
+			
+					ft.printf("\t\t\t</TR>\n");
+			
+					ft.printf("\t\t\t<TR class='tr_0'>\n");
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\t%s\n",pkgsSeen.get(0));
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\t%s\n",startDate.toString());
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\t%s\n",stopDate.toString());
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\t%s ms\n",new Long(stopDate.getTime()-exStartDate.getTime()).toString());
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD>\n");
+							ft.printf("\t\t\t\t\t%s ms\n",new Long(stopDate.getTime()-startDate.getTime()).toString());
+						ft.printf("\t\t\t\t</TD>\n");
+					ft.printf("\t\t\t</TR>\n");
+					
+				ft.printf("\t\t</TABLE>\n");
+			for (int i=0;i<pkgsSeen.size();++i){
+				int lineNo=0;
+				int rowNo=0;
+				fc=new Scanner(new File(histDir+pkgsSeen.get(i)+countFileSuffix));
+
+				prevCountList=countStore.get(i);		
+				
+				ft.printf("\t\t<TABLE class='file_tab'>\n");
+			
+					ft.printf("\t\t\t<TR class='tr_file'>\n");
+						ft.printf("\t\t\t\t<TD colspan='5'>\n");
+							ft.printf("\t\t\t\t\tFile: %s.adb \n",pkgsSeen.get(i));
+							if (!prevCountList.isEmpty())
+								ft.printf("\t\t\t\t\t(Continuation of previous execution counts)\n");
+						ft.printf("\t\t\t\t</TD>\n");
+					ft.printf("\t\t\t</TR>\n");
+					
+					ft.printf("\t\t\t<TR class='tr_hdr_file'>\n");
+					
+						ft.printf("\t\t\t\t<TD style='width:15%%'>\n");
+							ft.printf("\t\t\t\t\tType\n");
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD style='width:60%%'>\n");
+							ft.printf("\t\t\t\t\tValue\n");
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD style='width:10%%'>\n");
+							ft.printf("\t\t\t\t\tLine Range\n");
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD style='width:10%%'>\n");
+							ft.printf("\t\t\t\t\tByte Range\n");
+						ft.printf("\t\t\t\t</TD>\n");
+						
+						ft.printf("\t\t\t\t<TD style='width:5%%'>\n");
+							ft.printf("\t\t\t\t\tCount\n");
+						ft.printf("\t\t\t\t</TD>\n");
+					ft.printf("\t\t\t</TR>\n");
+				
+				while(fc.hasNextInt() && lineNo<headersAll.get(i).size()){
+					if (lineNo<prevCountList.size()){
+						count=fc.nextInt()+prevCountList.get(lineNo);
+						prevCountList.set(lineNo,count);
+					}
+					else{
+						count=fc.nextInt();
+						prevCountList.add(count);
+					}
+					
+					prevCountList.set(lineNo,count);
+						
+					hdr=headersAll.get(i).get(lineNo);
+					//Dont display the PROC_H & FUNC_H type header. Instead display the details in BLOCK type header
+					if (hdr.hdr.type != Type.PROC_H && hdr.hdr.type != Type.FUNC_H){ 					
+						curLevel=elePositionsAll.get(i).get(hdr.i).level*levelDisplayFactor+levelDisplayOffset;
+						level="";
+						for (int j=0;j<curLevel;++j)
+							level+="&nbsp;";
+
+						if (hdr.hdr.type == Type.BLOCK){
+							hdr=headersAll.get(i).get(lineNo-1);
+						}
+						
+						ft.printf("\t\t\t<TR class='tr_%d'>\n",rowNo%2);
+						
+							ft.printf("\t\t\t\t<TD>\n");
+								ft.printf("\t\t\t\t\t%s\n",level+"|-- "+hdr.hdr.type.toString());
+							ft.printf("\t\t\t\t</TD>\n");
+							
+							ft.printf("\t\t\t\t<TD>\n");
+								ft.printf("\t\t\t\t\t%s\n",hdr.hdr.value);
+							ft.printf("\t\t\t\t</TD>\n");
+							
+							ft.printf("\t\t\t\t<TD>\n");
+								ft.printf("\t\t\t\t\t%s - %s\n",+(hdr.hdr.loc.startLine+1),(hdr.hdr.loc.stopLine+1));
+							ft.printf("\t\t\t\t</TD>\n");
+							
+							ft.printf("\t\t\t\t<TD>\n");
+								ft.printf("\t\t\t\t\t%s - %s\n",(hdr.hdr.loc.startByte),(hdr.hdr.loc.stopByte));
+							ft.printf("\t\t\t\t</TD>\n");
+							
+							ft.printf("\t\t\t\t<TD>\n");
+								ft.printf("\t\t\t\t\t%s\n",count);
+							ft.printf("\t\t\t\t</TD>\n");
+						ft.printf("\t\t\t</TR>\n");
+
+						++rowNo;
+					}
+					++lineNo;
+					
+				}
+				ft.printf("\t\t</TABLE>\n");
+				fc.close();
+			}
+			
+			ft.printf("\t</BODY>\n");
+			ft.printf("</HTML>\n");
+			
+			ft.close();
+		}catch (Exception e){
+			frame.status.append("[ERROR] While generating Tree file <"+treeFile+">\n");
+			threadExit(false);
+		}
+		
+	}
+		
+		
+	public static void generateNestingLevels(){
+		int stopByte;
+		Stmt ele0,ele1;
+		for (int i=0;i<elePositions.size();++i){
+			ele0=elePositions.get(i);
+			stopByte=ele0.loc.stopByte;
+			for (int j=i-1;j>=0;--j){
+				ele1=elePositions.get(j);
+				if (stopByte<=ele1.loc.stopByte){
+					ele0.level=ele1.level+1;
+					break;
+				}
+			}
+		}
+	}
+	
+	public static void init(){
+	
+		//Generate Temporary Directory
+		tempDir=mainProc+tempDirSuffix+fs;
+		frame.status.append("[INFO] Generating Temporary Directory <"+tempDir+">\n");
+		(new File(tempDir)).mkdirs();
+		
+		//Generate Tree Directory
+		treeDir=mainProc+treeDirSuffix+fs;
+		frame.status.append("[INFO] Generating Tree Directory <"+treeDir+">\n");
+		(new File(treeDir)).mkdirs();
+		
+		//Generate Counts Directory
+		histDir=mainProc+histDirSuffix+fs;
+		frame.status.append("[INFO] Generating History Directory <"+histDir+">\n");
+		(new File(histDir)).mkdirs();
+			
+		treeFile=treeDir+mainProc+treeFileSuffix;
+		s_mainProc=new String(mainProc);
+		funcLoc=-1;
+		countStore.clear();
+		depPkg.clear();
+		pkgsSeen.clear();
+		elePositions.clear();
+		headers.clear();
+		elePositionsAll.clear();
+		headersAll.clear();
+		pkgsSeen.add(new String(mainProc));
+	}
+	
+	public static String getFileName(String fname){
+		if (fname.lastIndexOf('.')!=-1)
+			return fname.substring(0,fname.lastIndexOf('.')).trim();
+		else
+			return fname;
+	}
+	
+	public static void readCounts(){
+		try{
+			Scanner fc;	
+			for (int i=0;i<pkgsSeen.size();++i){
+				String countFile=histDir+pkgsSeen.get(i)+countFileSuffix;
+				ArrayList<Integer> prevCount=new ArrayList<Integer>();
+				int lineNo=0;
+				if (new File(countFile).exists()){
+					fc=new Scanner(new File(countFile));
+					while(fc.hasNextInt() && lineNo<headersAll.get(i).size()){
+						prevCount.add(fc.nextInt());
+						++lineNo;
+					}
+					fc.close();
+				}
+				countStore.add(prevCount);
+			}
+		}catch(Exception e){
+			frame.status.append("[ERROR] While reading previous counts\n");
+			threadExit(false);
+		}
+	}
+	
+	public static void writeCounts(){
+		try{
+			PrintStream fc;	
+			for (int i=0;i<pkgsSeen.size();++i){
+				String countFile=histDir+pkgsSeen.get(i)+countFileSuffix;
+				ArrayList<Integer> newCount=countStore.get(i);
+				if (!newCount.isEmpty()){
+					fc=new PrintStream(countFile);
+					for (int j=0;j<newCount.size();++j)
+						fc.printf("%d\t",newCount.get(j));
+					fc.close();
+				}
+			}
+		}catch (Exception e){
+			frame.status.append("[ERROR] While writing new counts\n");
+			threadExit(false);
+		}
+	}
+	
+	public static void generateFile(String fname, boolean isMain){
+		String m_fname="";
+		try{
+			String path=new File(fname).getParent();
+			if (path!=null)
+				path=path+fs;
+			else
+				path="";
+				
+			//Get Main Procedure name from file name
+			String t_fname=new File(fname).getName();
+			mainProc=getFileName(t_fname);
+				
+			if (isMain)
+				init();
+					
+			//Used by parser to read the file
+			fread=new FileReader(fname);
+			//Used by getString() to extract Portions of the source
+			fr=new RandomAccessFile(fname,"r");
+			//Perform the parsing
+			new parser(new Yylex(fread)).parse();
+			fread.close();
+			fr.close();
+			
+			//Sort according to startByte
+			Collections.sort(elePositions);
+			
+			//Merge all the headers into one arraylist
+			for (int i=0;i<elePositions.size();++i){
+				Stmt ele=elePositions.get(i);
+				for(int j=1;j<=ele.headers.size();j++){
+					headers.add(new Header(ele.headers.get(j-1),ele.type,i,j));
+				}
+			}
+			Collections.sort(headers);
+			
+			generateTokenFile();
+			
+			frame.status.append("[INFO] Generating nesting levels\n");
+			//Generate nesting levels
+			generateNestingLevels();
+			
+			//Save Values
+			ArrayList<Stmt> t_elePositions=new ArrayList<Stmt>();
+			ArrayList<Header> t_headers=new ArrayList<Header>();
+			ArrayList<String> t_depPkg=new ArrayList<String>();
+			t_elePositions.addAll(elePositions);
+			t_headers.addAll(headers);
+			t_depPkg.addAll(depPkg);
+			String t_mainProc=new String(mainProc);
+			
+			//Save arraylist globally for later used in tree file generation
+			elePositionsAll.add(t_elePositions);
+			headersAll.add(t_headers);
+			
+			//Clear Global array lists for next parse
+			elePositions.clear();
+			headers.clear();
+			depPkg.clear();
+			
+			
+			//Parse all dependent packages
+			for (int i=0;i<t_depPkg.size();++i){
+				String pkg=t_depPkg.get(i);
+				boolean alreadySeen=false;
+				for (int j=0;j<pkgsSeen.size();++j){
+					if (pkgsSeen.get(j).equalsIgnoreCase(pkg)){
+						//Package already parsed
+						alreadySeen=true;
+						break;
+					}
+				}
+				if (!alreadySeen){
+					//Check whether the file exist in the same directory as the source file
+					File f=new File(path+pkg+".adb");
+					if (f.exists()){
+						pkgsSeen.add(pkg);
+						//Recursive call
+						generateFile(path+pkg+".adb",false);
+					}
+				}
+			}
+			
+			fr=new RandomAccessFile(fname,"rw");
+			//Instrumented source file
+			m_fname=histDir+t_fname;
+			fw=new RandomAccessFile(m_fname,"rw");
+			fw.setLength(0);
+			
+			if (isMain){
+				for (int i=0;i<pkgsSeen.size();++i){
+					fw.writeBytes("with "+tokenPkgPrefix+pkgsSeen.get(i)+";"+nl);
+				}
+			}else
+				fw.writeBytes("with "+tokenPkgPrefix+t_mainProc+";"+nl);
+			
+			int prevPosition=0,nextPosition;
+			
+			//Write Instrumentation code
+			for (int i=0;i<t_headers.size();++i){
+				Header hdr=t_headers.get(i);
+				nextPosition=hdr.hdr.loc.stopByte;
+				fw.writeBytes(getString(new Location(prevPosition,nextPosition,0,0)));
+				if (hdr.j!=1 || (hdr.type!=Type.CASE && hdr.type!=Type.PROC && hdr.type!=Type.FUNC)){
+					//Skip first header for Case,Procedures and Functions
+					fw.writeBytes(nl+nl+"--Generation "+hdr.i+"("+hdr.j+") Start"+nl+"\t"+tokenPkgPrefix+t_mainProc+".counts_"+hdr.i+"("+hdr.j+"):="+tokenPkgPrefix+t_mainProc+".counts_"+hdr.i+"("+hdr.j+")+1;"+nl+"--Generation "+hdr.i+"("+hdr.j+") End"+nl+nl);
+				}
+				prevPosition=nextPosition;	
+			}
+			
+					
+			//Write the rest of the main file
+			if (funcLoc!=-1 && isMain){
+				fw.writeBytes(getString(new Location(prevPosition,funcLoc,0,0)));
+				fw.writeBytes(nl+nl+"--Function call start"+nl);
+				for (int i=0;i<pkgsSeen.size();++i){
+					String pkg=pkgsSeen.get(i);
+					fw.writeBytes("\t"+tokenPkgPrefix+pkg+".create_count_file;"+nl);
+				}
+				fw.writeBytes("--Function call end"+nl+nl);
+				prevPosition=funcLoc;
+			}
+			fw.writeBytes(getString(new Location(prevPosition,(int)fr.length(),0,0)));
+			fr.close();
+			fw.close();
+			frame.status.append("[INFO] Generated file <"+m_fname+">\n");
+			//Copy .ads file if it exists to the temporary directory
+			copyFile(histDir+t_mainProc+".ads",path+t_mainProc+".ads");
+
+		}catch (Exception e){
+			frame.status.append("[ERROR] While generating output file <"+m_fname+">\n");
+			threadExit(false);
+		}		
+	}
+	
+	public static void copyFile(String destFile,String srcFile){
+		try{
+			File inputFile = new File(srcFile);
+			File outputFile = new File(destFile);
+			if (inputFile.exists()){
+			
+				FileReader in = new FileReader(inputFile);
+				FileWriter out = new FileWriter(outputFile);
+				int c;
+				while ((c = in.read()) != -1)
+					out.write(c);
+
+				in.close();
+				out.close();
+				frame.status.append("[INFO] Copied "+srcFile+" to "+destFile+"\n");
+			}
+		}catch (Exception e){
+			frame.status.append("[ERROR] While copying file <"+srcFile+">\n");
+			threadExit(false);
+		}		
+	}
+	
+	public static boolean deleteDir(File dir) {
+		if (dir.isDirectory()) {
+			String[] children = dir.list();
+			for (int i=0; i<children.length; i++) {
+				boolean success = deleteDir(new File(dir, children[i]));
+				if (!success) {
+					return false;
+				}
+			}
+		}
+		frame.status.append("[INFO] Deleted "+dir.toString()+"\n");
+		return dir.delete();
+	}
+	
+	static public void performCleanUp(boolean error){
+		if (doCleanup || error){
+			frame.status.append("[INFO] Performing Clean Up\n");
+			deleteDir(new File(tempDir));
+			deleteDir(new File(s_mainProc+".exe"));
+		}
+		
+		if (!saveHistory){
+			frame.status.append("[INFO] Performing History Clean Up\n");
+			deleteDir(new File(histDir));
+		}
+		
+		if (error){
+			deleteDir(new File(treeDir));
+		}
+	}
+	
+	static public void threadExit(boolean isMain){	
+		frame.threadExit(isMain);
+	}
+:}	
+
+parser code{:
+
+		public static int runCmd(String str){
+			frame.status.append("[INFO] Running "+str+"\n");
+			Process proc=null;
+			try{
+				proc=Runtime.getRuntime().exec(str);
+				InputStream procIn=proc.getInputStream();
+				InputStream procErr=proc.getErrorStream();
+				OutputStream procOut=proc.getOutputStream();
+				while(true){
+					try{								
+						while (procIn.available()>0 || procErr.available()>0 || System.in.available()>0){
+							if (procErr.available()>0){
+								frame.status.append((char)procErr.read()+"");
+							}
+							else if(procIn.available()>0){
+								frame.status.append((char)procIn.read()+"");
+							}
+							else{
+								while(System.in.available()>0){
+									procOut.write(System.in.read());
+								}
+								procOut.flush();
+							}
+						}
+						proc.exitValue();	
+						if (procIn.available()>0 || procErr.available()>0 || System.in.available()>0){}
+						else
+							break;
+					}catch(IllegalThreadStateException e){
+						//still running
+					}
+				}
+			}catch(Exception e){
+				frame.status.append("[ERROR] Error while executing command "+str+"\n");
+				CUP$parser$actions.threadExit(false);
+			}
+			return proc.exitValue();
+		}
+
+		public static class AdaFrame extends JFrame{
+			JPanel panel;
+			JPanel parameters;
+			JPanel bottomPanel;
+			JTextArea status;
+			Container container;
+			JButton start;
+			JButton stop;
+			JButton clear;
+			JButton fileButton;
+			JButton summaryButton;
+			JButton instrButton;
+			JCheckBox cleanUp;
+			JCheckBox saveHistory;
+			JTextField fileField;
+			JTextField argsField;
+			Thread runThread;
+
+			int FRAMEWIDTH=700;
+			int FRAMEHEIGHT=350;
+			int SIDEPANELWIDTH=200;
+			int SIDEPANELCOMPONENTHEIGHT=20;
+			int SIDEPANELCOMPONENTBORDER=4;
+			int PANELBORDER=3;
+			int BOTTOMPANELHEIGHT=62;
+			private String parseFile="";
+			private String parseArgs="";
+			private boolean isRunning=false;
+
+
+			private File file;
+			
+			public void threadExit(boolean isMain){
+				if (isMain){
+					runThread.stop();
+				}
+
+				CUP$parser$actions.performCleanUp(true);
+				isRunning=false;
+				disableControls(true);
+				if (!isMain)
+					runThread.stop();
+			}
+				
+			private void fileChooser(String baseDir,String title){
+				JFileChooser chooser = new JFileChooser(baseDir);
+				chooser.setDialogTitle(title);
+				FileNameExtensionFilter filter = new FileNameExtensionFilter(".adb Files", "adb");
+				chooser.setFileFilter(filter);
+				int returnVal = chooser.showOpenDialog(null);
+				if(returnVal == JFileChooser.APPROVE_OPTION) {
+					file=chooser.getSelectedFile();
+					if (file.getName().indexOf(".adb")==-1){
+						status.append("[ERROR] Please Select A .adb File\n");
+						file=null;
+					}
+				}
+			}
+
+			public void disableControls(boolean enable){
+				fileField.setEnabled(enable);
+				fileButton.setEnabled(enable);
+				argsField.setEnabled(enable);
+				start.setEnabled(enable);
+				Component[] components=parameters.getComponents();
+				for (int i=0;i<components.length-2;++i){
+					((JComponent)(((Container)components[i]).getComponent(1))).setEnabled(enable);
+				}
+				cleanUp.setEnabled(enable);
+				saveHistory.setEnabled(enable);
+				
+				if (enable==true){
+					if (new File(System.getProperty("user.dir")+CUP$parser$actions.fs+CUP$parser$actions.treeFile).exists())
+						summaryButton.setEnabled(true);
+					if (new File(System.getProperty("user.dir")+CUP$parser$actions.fs+CUP$parser$actions.histDir).exists())
+						instrButton.setEnabled(true);
+				}else{
+					summaryButton.setEnabled(false);
+					instrButton.setEnabled(false);
+				}
+			}
+			
+			
+			class startThread implements Runnable{
+				public void run(){	
+					disableControls(false);
+					isRunning=true;
+					CUP$parser$actions.startDate=new Date();
+					status.append("[INFO] Parsing File: "+parseFile+"\n");
+					String t_fname=new File(parseFile).getName();
+
+					CUP$parser$actions.generateFile(parseFile,true);
+					CUP$parser$actions.readCounts();
+					String outFile=CUP$parser$actions.histDir+t_fname;
+					status.append("[INFO] Compilation started\n");
+			
+					if (runCmd("gnatmake "+outFile+" -D "+CUP$parser$actions.tempDir)!=0)
+						CUP$parser$actions.threadExit(false);
+				
+					status.append("[INFO] Executing Started\n");
+					CUP$parser$actions.exStartDate=new Date();
+					String cmdStr=CUP$parser$actions.s_mainProc+".exe "+parseArgs;
+			
+					runCmd(cmdStr);
+			
+					CUP$parser$actions.stopDate=new Date();	
+			
+					status.append("[INFO] Generating tree file <"+CUP$parser$actions.treeFile+">\n");
+					CUP$parser$actions.generateTree();
+					CUP$parser$actions.writeCounts();
+			
+					//clean up
+					CUP$parser$actions.performCleanUp(false);
+				
+					isRunning=false;
+					disableControls(true);
+					
+					
+				}
+			}
+
+
+
+			public void start(){
+			
+				if (CUP$parser$actions.levelDisplayFactor<0)
+					status.append("[ERROR] Invalid Level Display Factor Parameter\n");
+				else if (CUP$parser$actions.levelDisplayOffset<0)
+					status.append("[ERROR] Invalid Level Display Offset Parameter\n");
+				else if (parseFile.length()==0)
+					status.append("[ERROR] No Input File Specified\n");
+				else if (!new File(parseFile).exists())
+					status.append("[ERROR] Input File Does Not Exist\n");
+				else{
+					runThread=new Thread(new startThread());
+					runThread.start();
+				}
+			}
+
+
+			
+			private void update(){
+				Component[] components =parameters.getComponents();
+				for (int i=0;i<components.length;++i){
+					try{
+						if (i==0){
+							CUP$parser$actions.tempDirSuffix=((JTextField)(((Container)components[i]).getComponent(1))).getText();
+						}
+						if (i==1){
+							CUP$parser$actions.treeDirSuffix=((JTextField)(((Container)components[i]).getComponent(1))).getText();
+						}
+						if (i==2){
+							CUP$parser$actions.histDirSuffix=((JTextField)(((Container)components[i]).getComponent(1))).getText();
+						}
+						if (i==3){
+							CUP$parser$actions.tokenPkgPrefix=((JTextField)(((Container)components[i]).getComponent(1))).getText();
+						}
+						if (i==4){
+							CUP$parser$actions.treeFileSuffix=((JTextField)(((Container)components[i]).getComponent(1))).getText();
+						}
+						if (i==5)
+							CUP$parser$actions.countFileSuffix=((JTextField)(((Container)components[i]).getComponent(1))).getText();
+						if (i==6)
+							CUP$parser$actions.levelDisplayFactor=Integer.parseInt(((JTextField)(((Container)components[i]).getComponent(1))).getText());
+						if (i==7)
+							CUP$parser$actions.levelDisplayOffset=Integer.parseInt(((JTextField)(((Container)components[i]).getComponent(1))).getText());
+						if (i==8){
+							if(cleanUp.isSelected())
+								CUP$parser$actions.doCleanup=true;
+							else
+								CUP$parser$actions.doCleanup=false;
+						}
+						if (i==9){
+							if(saveHistory.isSelected())
+								CUP$parser$actions.saveHistory=true;
+							else
+								CUP$parser$actions.saveHistory=false;
+						}
+
+					}catch (NumberFormatException e){
+						status.append("[ERROR] Invalid Parameter Value\n");
+						if (i==6)
+							CUP$parser$actions.levelDisplayFactor=3;
+						if (i==7)
+							CUP$parser$actions.levelDisplayOffset=0;
+					}
+				}
+			}
+
+
+
+
+
+
+
+			public JPanel createField(String text,String value){
+				JPanel textPanel=new JPanel();
+				textPanel.setLayout(new BoxLayout(textPanel,BoxLayout.X_AXIS));
+				JLabel label=new JLabel(text+" : ");
+				JTextField field=new JTextField(value);
+				textPanel.add(label);
+				textPanel.add(field);
+				textPanel.setAlignmentX(0);
+				textPanel.setMaximumSize(new Dimension(SIDEPANELWIDTH,SIDEPANELCOMPONENTHEIGHT+2*SIDEPANELCOMPONENTBORDER));
+				field.getDocument().addDocumentListener(new DocumentListener(){
+												public void insertUpdate(DocumentEvent event){
+													update();
+												}
+												public void removeUpdate(DocumentEvent event){
+													update();
+												}
+												public void changedUpdate(DocumentEvent event){}
+											});
+				return textPanel;
+			}
+			
+			final String[] browsers = { "google-chrome", "firefox", "opera", "epiphany", "konqueror", "conkeror", "midori", "kazehakase", "mozilla" };  				
+			public void openURL(String url) { 
+				try { //attempt to use Desktop library from JDK 1.6+ 
+				Class<?> d = Class.forName("java.awt.Desktop"); 
+				d.getDeclaredMethod("browse", new Class[] {java.net.URI.class}).invoke( d.getDeclaredMethod("getDesktop").invoke(null), new Object[] {java.net.URI.create(url)}); //above code mimicks: java.awt.Desktop.getDesktop().browse() 
+				} catch (Exception ignore) { 
+					//library not available or failed 
+					String osName = System.getProperty("os.name"); 
+					try { 
+						if (osName.startsWith("Mac OS")) { 
+							Class.forName("com.apple.eio.FileManager").getDeclaredMethod( "openURL", new Class[] {String.class}).invoke(null, new Object[] {url}); 
+						} else if (osName.startsWith("Windows")) 
+							Runtime.getRuntime().exec( "rundll32 url.dll,FileProtocolHandler " + url); 
+						else { //assume Unix or Linux 
+							String browser = null; 
+							for (String b : browsers) 
+								if (browser == null && Runtime.getRuntime().exec(new String[] {"which", b}).getInputStream().read() != -1) 
+									Runtime.getRuntime().exec(new String[] {browser = b, url}); 
+							if (browser == null) throw new Exception(Arrays.toString(browsers)); 
+						} 
+					} catch (Exception e) { 
+						status.append("[ERROR] Attempting to launch browser\n"); 
+					} 
+				} 
+			} 
+
+			public void initialize(){
+				panel=new JPanel();
+				panel.setLayout(new BorderLayout());
+				//Parameter Panel
+				parameters=new JPanel();
+				parameters.setLayout(new BoxLayout(parameters,BoxLayout.Y_AXIS));
+				parameters.setPreferredSize(new Dimension(SIDEPANELWIDTH,FRAMEHEIGHT-BOTTOMPANELHEIGHT-4*PANELBORDER));
+				parameters.add(createField("Temp Dir Suffix","_temp"));
+				parameters.add(createField("Tree Dir Suffix","_tree"));
+				parameters.add(createField("History Dir Suffix","_history"));
+				parameters.add(createField("Token Prefix","T_"));
+				parameters.add(createField("Tree File Suffix","_tree.html"));
+				parameters.add(createField("Counts File Suffix","_counts.txt"));
+				parameters.add(createField("Level Factor","3"));
+				parameters.add(createField("Level Offset","0"));
+
+				parameters.add(cleanUp=new JCheckBox("Clean Up",true));
+				cleanUp.addActionListener(new ActionListener(){
+												public void actionPerformed(ActionEvent event){
+													update();
+												}
+											});
+				parameters.add(saveHistory=new JCheckBox("Save History",true));
+				saveHistory.addActionListener(new ActionListener(){
+												public void actionPerformed(ActionEvent event){
+													update();
+												}
+											});
+				parameters.setBorder(new EmptyBorder(PANELBORDER,PANELBORDER,PANELBORDER,PANELBORDER));
+
+				//Status text area
+				status=new JTextArea();
+				status.setFont(new Font("Monospaced",Font.PLAIN,12));
+				status.setEditable(false);
+				status.setBackground(Color.BLACK);
+				status.setForeground(Color.GREEN);
+				status.append("\t-------------------------------------------------\n");
+				status.append("\t          Ada Instrumentation v1.0b\n");
+				status.append("\tBegin by choosing a ada source file! Have Fun!!!!\n");
+				status.append("\t-------------------------------------------------\n");
+				JScrollPane scrollPane=new JScrollPane(status);
+				scrollPane.setPreferredSize(new Dimension(FRAMEWIDTH-SIDEPANELWIDTH-4*PANELBORDER,FRAMEHEIGHT-BOTTOMPANELHEIGHT-4*PANELBORDER));
+				scrollPane.setBorder(new EmptyBorder(PANELBORDER,PANELBORDER,PANELBORDER,PANELBORDER));
+
+				//Bottom Panel
+				bottomPanel=new JPanel();
+				bottomPanel.setBorder(new EmptyBorder(PANELBORDER,PANELBORDER,PANELBORDER,PANELBORDER));
+				bottomPanel.setMaximumSize(new Dimension(FRAMEWIDTH-2*PANELBORDER,BOTTOMPANELHEIGHT));
+				bottomPanel.setLayout(new BoxLayout(bottomPanel,BoxLayout.Y_AXIS));
+				
+				//Bottom Panel File Chooser
+				JPanel bottomPanel0=new JPanel();
+				bottomPanel0.setMaximumSize(new Dimension(FRAMEWIDTH-2*PANELBORDER,BOTTOMPANELHEIGHT/2));
+
+				fileField=new JTextField("Choose a file",30);
+				argsField=new JTextField("Argument List",20);
+				fileButton=new JButton("Choose File");
+
+				fileField.getDocument().addDocumentListener(new DocumentListener(){
+												public void insertUpdate(DocumentEvent event){
+													parseFile=fileField.getText();
+												}
+												public void removeUpdate(DocumentEvent event){
+													parseFile=fileField.getText();
+												}
+												public void changedUpdate(DocumentEvent event){
+													parseFile=fileField.getText();
+												}
+											});
+				argsField.getDocument().addDocumentListener(new DocumentListener(){
+												public void insertUpdate(DocumentEvent event){
+													parseArgs=argsField.getText();
+												}
+												public void removeUpdate(DocumentEvent event){
+													parseArgs=argsField.getText();
+												}
+												public void changedUpdate(DocumentEvent event){
+													parseArgs=argsField.getText();
+												}
+											});
+
+				fileButton.addActionListener(new ActionListener(){
+										public void actionPerformed (ActionEvent e){
+											file=null;
+											fileChooser(System.getProperty("user.dir"),"Choose Main Procedure");
+											if (file!=null)
+												parseFile=file.toString();
+											else
+												parseFile="";
+											fileField.setText(parseFile);
+										}
+									});
+
+				bottomPanel0.add(fileField);
+				bottomPanel0.add(argsField);
+				bottomPanel0.add(fileButton);
+			
+				//Bottom Panel Buttons
+				JPanel bottomPanel1=new JPanel();
+				bottomPanel1.setMaximumSize(new Dimension(FRAMEWIDTH-2*PANELBORDER,BOTTOMPANELHEIGHT/2));
+				start=new JButton("Start Parsing");
+				stop=new JButton("Stop Parsing");
+				clear=new JButton("Clear");
+				summaryButton=new JButton("View Summary");
+				instrButton=new JButton("View Instrumented Code");
+				
+				summaryButton.setEnabled(false);
+				instrButton.setEnabled(false);
+
+
+				start.addActionListener(new ActionListener(){
+												public void actionPerformed(ActionEvent event){
+													start();
+												}
+											});
+				stop.addActionListener(new ActionListener(){
+												public void actionPerformed(ActionEvent event){
+													if (isRunning){
+														threadExit(true);
+														status.append("[INFO] Parsing Stopped\n");
+													}
+													else
+														status.append("[INFO] Parsing Not Started\n");
+												}
+											});
+
+				clear.addActionListener(new ActionListener(){
+												public void actionPerformed(ActionEvent event){
+													status.setText("");
+												}
+											});
+				
+				summaryButton.addActionListener(new ActionListener(){
+												public void actionPerformed(ActionEvent event){
+													openURL(System.getProperty("user.dir")+CUP$parser$actions.fs+CUP$parser$actions.treeFile);
+												}
+											});
+				instrButton.addActionListener(new ActionListener(){
+												public void actionPerformed(ActionEvent event){
+													file=null;
+													fileChooser(System.getProperty("user.dir")+CUP$parser$actions.fs+CUP$parser$actions.histDir,"Choose Instrumented File");
+													if (file!=null){
+														openURL(file.toString());
+													}
+												}
+											});
+				bottomPanel1.add(start);
+				bottomPanel1.add(stop);
+				bottomPanel1.add(clear);
+				bottomPanel1.add(summaryButton);
+				bottomPanel1.add(instrButton);
+				
+				
+				bottomPanel.add(bottomPanel0);
+				bottomPanel.add(bottomPanel1);
+
+				panel.add(parameters,BorderLayout.EAST);
+				panel.add(scrollPane,BorderLayout.WEST);
+				panel.add(bottomPanel,BorderLayout.SOUTH);
+				container.add(panel);
+
+			}
+
+			AdaFrame(){
+				this.setSize(FRAMEWIDTH,FRAMEHEIGHT);
+				this.setResizable(false);
+				this.setTitle("Ada Instrumentation v1.0b");
+				this.setDefaultCloseOperation(EXIT_ON_CLOSE);
+				container=this.getContentPane();
+				initialize();
+			}
+		}		
+		
+		public static AdaFrame frame;
+		
+		public static void main(String[] args){
+			frame=new AdaFrame();
+			CUP$parser$actions.frame=frame;
+			frame.setVisible(true);
+		}
+					
+:}
+
+terminal String TIC,DOT_DOT,LT_LT,BOX,LT_EQ,EXPON,NE,GT_GT;
+terminal String GE,IS_ASSIGNED,RIGHT_SHAFT,ABORT,ABS,ABSTRACT,ACCEPT;
+terminal String ACCESS,ALIASED,ALL,AND,ARRAY,AT,BEGIN;
+terminal String BODY,CASE,CONSTANT,DECLARE,DELAY,DELTA,DIGITS,DO;
+terminal String ELSE,ELSIF,END,ENTRY,EXCEPTION,EXIT,FOR,FUNCTION;
+terminal String GENERIC,GOTO,IF,IN,IS,LIMITED,LOOP,MOD;
+terminal String NEW,NOT,NuLL,OF,OR,OTHERS,OUT,PACKAGE;
+terminal String PRAGMA,PRIVATE,PROCEDURE,PROTECTED,RAISE,RANGE,RECORD,REM;
+terminal String RENAMES,REQUEUE,RETURN,REVERSE,SELECT,SEPARATE,SUBTYPE,TAGGED;
+terminal String TASK,TERMINATE,THEN,TYPE,UNTIL,USE,WHEN,WHILE;
+terminal String WITH,XOR,char_lit,identifier,char_string,numeric_lit;
+terminal String DOT,LT,LPAR,PLUS,BAR,BITAND,AST,RPAR;
+terminal String SEMI,MINUS,FSLASH,COMMA,GT,COLON,EQUAL;
+
+non terminal String goal_symbol,pragma,pragma_arg_s,pragma_arg,pragma_s,decl,object_decl,def_id_s,def_id;
+non terminal String object_qualifier_opt,object_subtype_def,init_opt,number_decl,type_decl,discrim_part_opt;
+non terminal String type_completion,type_def,subtype_decl,subtype_ind,constraint,decimal_digits_constraint;
+non terminal String derived_type,range_constraint,range,enumeration_type,enum_id_s,enum_id,integer_type;
+non terminal String component_subtype_def,aliased_opt,index_s,index,iter_index_constraint,iter_discrete_range_s,discrete_range,range_constr_opt ;
+non terminal String range_spec,range_spec_opt,real_type,float_type,fixed_type,array_type,unconstr_array_type,constr_array_type ;
+non terminal String record_type,record_def,tagged_opt,comp_list,comp_decl_s,variant_part_opt,comp_decl,discrim_part;
+non terminal String discrim_spec_s,discrim_spec,access_opt,variant_part,variant_s,variant,choice_s,choice ;
+non terminal String discrete_with_range,access_type,prot_opt,decl_part,decl_item_s,decl_item_s1,decl_item,decl_item_or_body_s1 ;
+non terminal String decl_item_or_body,body,name,mark,simple_name,compound_name,used_char ;
+non terminal String operator_symbol,indexed_comp,value_s,value,selected_comp,attribute,attribute_id,literal;
+non terminal String aggregate,value_s_2,comp_assoc,expression,logical,short_circuit,relation,relational ;
+non terminal String membership,simple_expression,unary,adding,term,multiplying,factor,primary ;
+non terminal String parenthesized_primary,qualified,allocator,statement_s,statement,unlabeled,simple_stmt,compound_stmt ;
+non terminal String label,null_stmt,assign_stmt,if_stmt,cond_clause,cond_part,condition ;
+non terminal String else_opt,case_stmt,loop_stmt,label_opt ;
+non terminal String iter_part,reverse_opt,basic_loop,id_opt,block,block_decl,handled_stmt_s,block_body ;
+non terminal String except_handler_part_opt,exit_stmt,name_opt,when_opt,return_stmt,goto_stmt,subprog_decl ;
+non terminal String designator,formal_part_opt,formal_part,param_s,param,mode,subprog_body ;
+non terminal String procedure_call,pkg_decl,pkg_spec,private_part,c_id_opt,c_name_list,pkg_body,body_opt,private_type,limited_opt;
+non terminal String use_clause,name_s,rename_decl,rename_unit,renames,task_decl,task_spec,task_def,task_private_opt;
+non terminal String task_body,prot_decl,prot_spec,prot_def,prot_private_opt,prot_op_decl_s,prot_op_decl,prot_elem_decl_s ;
+non terminal String prot_elem_decl,prot_body,prot_op_body_s,prot_op_body,entry_decl_s,entry_decl,entry_body,entry_body_part ;
+non terminal String rep_spec_s,entry_call,accept_stmt,accept_hdr,entry_name,delay_stmt,select_stmt,select_wait ;
+non terminal String guarded_select_alt,or_select,select_alt,delay_or_entry_alt,async_select,timed_entry_call,cond_entry_call ;
+non terminal String stmts_opt,abort_stmt,compilation,comp_unit,private_opt,context_spec,with_clause,use_clause_opt ;
+non terminal String unit,subunit,subunit_body,body_stub,exception_decl,except_handler_part,exception_handler,except_choice_s ;
+non terminal String except_choice,raise_stmt,requeue_stmt,generic_decl,generic_formal_part,generic_formal,generic_discrim_part_opt ;
+non terminal String subp_default,generic_type_def,generic_derived_type,generic_subp_inst,generic_pkg_inst ;
+non terminal String generic_inst,rep_spec,attrib_def,record_type_spec,align_opt,comp_loc_s,address_spec,code_stmt ;
+non terminal Stmt case_hdr,alternative,iteration,subprog_spec_is_push,subprog_spec;
+non terminal ArrayList<Stmt> alternative_s,cond_clause_s;
+
+
+goal_symbol ::= compilation ;
+	
+
+pragma  ::= PRAGMA identifier SEMI
+	| PRAGMA simple_name LPAR pragma_arg_s RPAR SEMI
+	;
+
+pragma_arg_s ::= pragma_arg
+	| pragma_arg_s COMMA pragma_arg
+	;
+
+pragma_arg ::= expression
+	| simple_name RIGHT_SHAFT expression
+	;
+
+pragma_s ::=
+	| pragma_s pragma
+	;
+
+decl    ::= object_decl
+	| number_decl
+	| type_decl
+	| subtype_decl
+	| subprog_decl
+	| pkg_decl
+	| task_decl
+	| prot_decl
+	| exception_decl
+	| rename_decl
+	| generic_decl
+	| body_stub
+	| error SEMI
+	;
+
+object_decl ::= def_id_s COLON object_qualifier_opt object_subtype_def init_opt SEMI
+	;
+
+def_id_s ::= def_id
+	| def_id_s COMMA def_id
+	;
+
+def_id  ::= identifier
+	;
+
+object_qualifier_opt ::=
+	| ALIASED
+	| CONSTANT
+	| ALIASED CONSTANT
+	;
+
+object_subtype_def ::= subtype_ind
+	| array_type
+	;
+
+init_opt ::=
+	| IS_ASSIGNED expression
+	;
+
+number_decl ::= def_id_s COLON CONSTANT IS_ASSIGNED expression SEMI
+	;
+
+type_decl ::= TYPE identifier discrim_part_opt type_completion SEMI
+	;
+
+discrim_part_opt ::=
+	| discrim_part
+	| LPAR BOX RPAR
+	;
+
+type_completion ::=
+	| IS type_def
+	;
+
+type_def ::= enumeration_type 
+	| integer_type
+	| real_type
+	| array_type
+	| record_type
+	| access_type
+	| derived_type
+	| private_type
+	;
+
+subtype_decl ::= SUBTYPE identifier IS subtype_ind SEMI
+	;
+
+subtype_ind ::= name constraint
+	| name
+	;
+
+constraint ::= range_constraint
+	| decimal_digits_constraint
+	;
+
+decimal_digits_constraint ::= DIGITS expression range_constr_opt
+	;
+
+derived_type ::= NEW subtype_ind
+	| NEW subtype_ind WITH PRIVATE
+	| NEW subtype_ind WITH record_def
+	| ABSTRACT NEW subtype_ind WITH PRIVATE
+	| ABSTRACT NEW subtype_ind WITH record_def
+	;
+
+range_constraint ::= RANGE range
+	;
+
+range ::= simple_expression DOT_DOT simple_expression
+	| name TIC RANGE
+	| name TIC RANGE LPAR expression RPAR
+	;
+
+enumeration_type ::= LPAR enum_id_s RPAR
+	;
+
+enum_id_s ::= enum_id
+	| enum_id_s COMMA enum_id
+	;
+
+enum_id ::= identifier
+	| char_lit
+	;
+
+integer_type ::= range_spec
+	| MOD expression
+	;
+	
+
+range_spec ::= range_constraint
+	;
+
+range_spec_opt ::=
+	| range_spec
+	;
+
+real_type ::= float_type
+	| fixed_type
+	;
+
+float_type ::= DIGITS expression range_spec_opt
+	;
+
+fixed_type ::= DELTA expression range_spec
+	| DELTA expression DIGITS expression range_spec_opt
+	;
+
+array_type ::= unconstr_array_type
+	| constr_array_type
+	;
+
+unconstr_array_type ::= ARRAY LPAR index_s RPAR OF component_subtype_def
+	;
+
+constr_array_type ::= ARRAY iter_index_constraint OF component_subtype_def
+	;
+
+component_subtype_def ::= aliased_opt subtype_ind
+	;
+
+aliased_opt ::= 
+	| ALIASED
+	;
+
+index_s ::= index
+	| index_s COMMA index
+	;
+
+index ::= name RANGE BOX
+	;
+	
+iter_index_constraint ::= LPAR iter_discrete_range_s RPAR
+	;
+
+
+iter_discrete_range_s ::= discrete_range
+	| iter_discrete_range_s COMMA discrete_range
+	;
+
+discrete_range ::= name range_constr_opt
+	| range
+	;
+
+range_constr_opt ::=
+	| range_constraint
+	;
+
+record_type ::= tagged_opt limited_opt record_def
+	;
+
+record_def ::= RECORD pragma_s comp_list END RECORD
+	| NuLL RECORD
+	;
+
+tagged_opt ::=
+	| TAGGED
+	| ABSTRACT TAGGED
+	;
+
+comp_list ::= comp_decl_s variant_part_opt
+	| variant_part pragma_s
+	| NuLL SEMI pragma_s
+	;
+
+comp_decl_s ::= comp_decl
+	| comp_decl_s pragma_s comp_decl
+	;
+
+variant_part_opt ::= pragma_s
+	| pragma_s variant_part pragma_s
+	;
+
+comp_decl ::= def_id_s COLON component_subtype_def init_opt SEMI
+	| error SEMI
+	;
+
+discrim_part ::= LPAR discrim_spec_s RPAR
+	;
+
+discrim_spec_s ::= discrim_spec
+	| discrim_spec_s SEMI discrim_spec
+	;
+
+discrim_spec ::= def_id_s COLON access_opt mark init_opt
+	| error
+	;
+
+access_opt ::=
+	| ACCESS
+	;
+
+variant_part ::= CASE simple_name IS pragma_s variant_s END CASE SEMI
+	;
+
+variant_s ::= variant
+	| variant_s variant
+	;
+
+variant ::= WHEN choice_s RIGHT_SHAFT pragma_s comp_list
+	;
+
+choice_s ::= choice
+	| choice_s BAR choice
+	;
+
+choice ::= expression
+	| discrete_with_range
+	| OTHERS
+	;
+
+discrete_with_range ::= name range_constraint
+	| range
+	;
+
+access_type ::= ACCESS subtype_ind
+	| ACCESS CONSTANT subtype_ind
+	| ACCESS ALL subtype_ind
+	| ACCESS:e1 prot_opt:e2 PROCEDURE:e3 formal_part_opt:e4
+	| ACCESS:e1 prot_opt:e2 FUNCTION:e3 formal_part_opt RETURN mark:e4
+	;
+
+prot_opt ::=
+	| PROTECTED
+	;
+
+decl_part ::=
+	| decl_item_or_body_s1
+	;
+
+decl_item_s ::= 
+	| decl_item_s1
+	;
+
+decl_item_s1 ::= decl_item
+	| decl_item_s1 decl_item
+	;
+
+decl_item ::= decl
+	| use_clause
+	| rep_spec
+	| pragma
+	;
+
+decl_item_or_body_s1 ::= decl_item_or_body
+	| decl_item_or_body_s1 decl_item_or_body
+	;
+
+decl_item_or_body ::= body
+	| decl_item
+	;
+
+body ::= subprog_body
+	| pkg_body
+	| task_body
+	| prot_body
+	;
+
+name ::= simple_name
+	| indexed_comp
+	| selected_comp
+	| attribute
+	| operator_symbol
+	;
+
+mark ::= simple_name
+	| mark TIC attribute_id
+	| mark DOT simple_name
+	;
+
+simple_name ::= identifier:e1 										{: RESULT=(String)e1; :}
+	;
+
+compound_name ::= simple_name:e1									{: RESULT=(String)e1; :}
+	| compound_name:e1 DOT simple_name								{: RESULT=(String)e1; :}					
+	;
+
+c_name_list ::= compound_name:e1									{: RESULT=(String)e1; :}
+	 | c_name_list:e1 COMMA compound_name							{: RESULT=(String)e1; :}
+	;
+
+used_char ::= char_lit
+	;
+
+operator_symbol ::= char_string
+	;
+
+indexed_comp ::= name LPAR value_s RPAR
+	;
+
+value_s ::= value
+	| value_s COMMA value
+	;
+
+value ::= expression
+	| comp_assoc
+	| discrete_with_range
+	| error
+	;
+
+selected_comp ::= name DOT simple_name
+	| name DOT used_char
+	| name DOT operator_symbol
+	| name DOT ALL
+	;
+
+attribute ::= name TIC attribute_id
+	;
+
+attribute_id ::= identifier
+	| DIGITS
+	| DELTA
+	| ACCESS
+	;
+
+literal ::= numeric_lit
+	| used_char
+	| NuLL
+	;
+
+aggregate ::= LPAR comp_assoc RPAR
+	| LPAR value_s_2 RPAR
+	| LPAR expression WITH value_s RPAR
+	| LPAR expression WITH NuLL RECORD RPAR
+	| LPAR NuLL RECORD RPAR
+	;
+
+value_s_2 ::= value COMMA value
+	| value_s_2 COMMA value
+	;
+
+comp_assoc ::= choice_s RIGHT_SHAFT expression
+	;
+
+expression ::= relation
+	| expression logical relation
+	| expression short_circuit relation
+	;
+
+logical ::= AND
+	| OR
+	| XOR
+	;
+
+short_circuit ::= AND THEN
+	| OR ELSE
+	;
+
+relation ::= simple_expression
+	| simple_expression relational simple_expression
+	| simple_expression membership range
+	| simple_expression membership name
+	;
+
+relational ::= EQUAL
+	| NE
+	| LT
+	| LT_EQ
+	| GT
+	| GE
+	;
+
+membership ::= IN
+	| NOT IN
+	;
+
+simple_expression ::= unary term
+	| term
+	| simple_expression adding term
+	;
+
+unary   ::= PLUS
+	| MINUS
+	;
+
+adding  ::= PLUS
+	| MINUS
+	| BITAND
+	;
+
+term    ::= factor
+	| term multiplying factor
+	;
+
+multiplying ::= AST
+	| FSLASH
+	| MOD
+	| REM
+	;
+
+factor ::= primary
+	| NOT primary
+	| ABS primary
+	| primary EXPON primary
+	;
+
+primary ::= literal
+	| name
+	| allocator
+	| qualified
+	| parenthesized_primary
+	;
+
+parenthesized_primary ::= aggregate
+	| LPAR expression RPAR
+	;
+
+qualified ::= name TIC parenthesized_primary
+	;
+
+allocator ::= NEW name
+	| NEW qualified
+	;
+
+statement_s ::= statement
+	| statement_s statement
+	;
+
+statement ::= unlabeled
+	| label statement
+	;
+
+unlabeled ::= simple_stmt
+	| compound_stmt
+	| pragma
+	;
+
+simple_stmt ::= null_stmt
+	| assign_stmt
+	| exit_stmt
+	| return_stmt
+	| goto_stmt
+	| procedure_call
+	| delay_stmt
+	| abort_stmt
+	| raise_stmt
+	| code_stmt
+	| requeue_stmt
+	| error SEMI
+	;
+
+compound_stmt ::= if_stmt
+	| case_stmt
+	| loop_stmt
+	| block
+	| accept_stmt
+	| select_stmt
+	;
+
+label ::= LT_LT identifier GT_GT
+	;
+
+null_stmt ::= NuLL SEMI
+	;
+
+assign_stmt ::= name IS_ASSIGNED expression SEMI
+	;
+
+if_stmt ::= IF:e1 cond_clause_s:e2 else_opt:e3 END IF SEMI:e4	{:		
+																	getInteger(e1,0);
+																	getInteger(e4,1);
+
+																	temp=new Stmt(new Location(startByte,stopByte+1,startLine,stopLine),Type.IF,"");
+																	temp.headers.addAll((ArrayList<Stmt>)e2);
+																	temp.headers.get(0).loc.startByte=startByte;
+																	temp.headers.get(0).loc.startLine=startLine;
+																	temp.headers.get(0).value=getString(new Location(startByte+2,temp.headers.get(0).loc.stopByte-4,0,0)).trim();
+																	if (e3!=null){
+																		getInteger(e3,0);
+																		temp.headers.add(new Stmt(new Location(startByte,startByte+4,startLine,startLine),Type.ELSE_H,getString(new Location(startByte,startByte+4,0,0))));
+																	}
+										    
+																	elePositions.add(temp);			
+																:}
+	;
+
+cond_clause_s ::= cond_clause:e1								{:	
+																	RESULT=new ArrayList<Stmt>();
+																	getInteger(e1,1);
+																	RESULT.add(new Stmt(new Location(0,stopByte+4,0,stopLine),Type.IF_H,""));
+																:}
+																
+	| cond_clause_s:e1 ELSIF:e2 cond_clause:e3 					{:	
+																	getInteger(e2,0);
+																	getInteger(e3,1);
+																	((ArrayList<Stmt>)e1).add(new Stmt(new Location(startByte,stopByte+4,startLine,stopLine),Type.ELSIF_H,getString(new Location(startByte+5,stopByte,0,0)).trim()));
+																	RESULT=new ArrayList<Stmt>((ArrayList<Stmt>)e1);	
+																:}
+
+	;
+
+cond_clause ::= cond_part:e1 statement_s						{:	
+																	RESULT=(String)e1;	
+																:}
+	;
+
+cond_part ::= condition THEN:e1									{:	
+																	RESULT=(String)e1; 
+																:}
+	;
+
+condition ::= expression
+	;
+
+else_opt ::=													{:	
+																	RESULT=null;
+																:}
+																
+	| ELSE:e1 statement_s										{: 	
+																	RESULT=(String)e1;	
+																:}				
+	;
+
+case_stmt ::= case_hdr:e1 pragma_s alternative_s:e2 END CASE SEMI:e3 	{:	
+																			startByte=((Stmt)e1).loc.startByte;
+																			startLine=((Stmt)e1).loc.startLine;
+																			getInteger(e3,1);
+																			temp=new Stmt(new Location(startByte,stopByte+1,startLine,stopLine),Type.CASE,getString(new Location(startByte,stopByte+1,0,0)));
+																			temp.headers.add((Stmt)e1);
+																			temp.headers.addAll((ArrayList<Stmt>)e2);
+																			elePositions.add(temp);															
+																		:}
+	;
+
+case_hdr ::= CASE:e1 expression IS:e2 									{:	
+																			getInteger(e1,0);
+																			getInteger(e2,1);
+																			RESULT=new Stmt(new Location(startByte,stopByte+2,startLine,stopLine),Type.CASE_H,getString(new Location(startByte+4,stopByte,0,0)).trim()); 
+																		:}
+	;
+
+alternative_s ::=														{:	
+																			RESULT=new ArrayList<Stmt>();		
+																		:}
+																		
+	| alternative_s:e1 alternative:e2 									{:	
+																			((ArrayList<Stmt>)e1).add((Stmt)e2);
+																			RESULT=new ArrayList<Stmt>((ArrayList<Stmt>)e1);	
+																		:}
+	;
+
+alternative ::= WHEN:e1 choice_s RIGHT_SHAFT:e2 statement_s				{:		
+																			getInteger(e1,0);
+																			getInteger(e2,1);
+																			RESULT=new Stmt(new Location(startByte,stopByte+2,startLine,stopLine),Type.WHEN_H,getString(new Location(startByte+4,stopByte,0,0)).trim()); 
+																		:}
+	;
+
+	
+loop_stmt ::= label_opt:e1 iteration:e2 basic_loop:e3 id_opt SEMI:e4	{:	
+																			if (e1==null){
+																				if (e2==null){
+																					getInteger(e3,0);
+																				}
+																				else{
+																					startByte=((Stmt)e2).loc.startByte;
+																					startLine=((Stmt)e2).loc.startLine;
+																				}
+																			}else{ 
+																					getInteger(e1,0);
+																			}
+																			getInteger(e4,1);
+																			getInteger(e3,3);
+																			if (e2!=null){
+																				if (((Stmt)e2).type==Type.WHILE_H){
+																					temp=new Stmt(new Location(startByte,stopByte+1,startLine,stopLine),Type.WHILE,getString(new Location(startLine,stopLine+1,0,0)));
+																					temp.headers.add(new Stmt(new Location(startByte,stopByte1+4,startLine,stopLine1),Type.WHILE_H,getString(new Location(((Stmt)e2).loc.startByte+5,stopByte1,0,0)).trim()));
+																				}else{
+																					temp=new Stmt(new Location(startByte,stopByte+1,startLine,stopLine),Type.FOR,getString(new Location(startByte,stopByte+1,0,0)));
+																					temp.headers.add(new Stmt(new Location(startByte,stopByte1+4,startLine,stopLine),Type.FOR_H,getString(new Location(((Stmt)e2).loc.startByte+3,stopByte1,0,0)).trim()));
+																				}
+																			}else{ 
+																					temp=new Stmt(new Location(startByte,stopByte+1,startLine,stopLine),Type.LOOP,getString(new Location(startByte,stopByte+1,0,0)));
+																					temp.headers.add(new Stmt(new Location(startByte,stopByte1+4,startLine,stopLine),Type.LOOP_H,""));
+																			}
+																
+																			
+																			elePositions.add(temp);
+																		:}
+																			
+	;
+
+label_opt ::= 															{:	
+																			RESULT=null;					
+																		:}	
+																		
+	| identifier:e1 COLON												{:	
+																			RESULT=new String((String)e1);	
+																		:}
+	;
+
+iteration ::=															{:	
+																			RESULT=null;				
+																		:}
+																		
+	| WHILE:e1 condition										        {:	
+																			getInteger(e1,0);
+																			RESULT=new Stmt(new Location(startByte,0,startLine,0),Type.WHILE_H,"");
+																		:}
+																		
+	| iter_part:e1 reverse_opt discrete_range							{:						
+																			getInteger(e1,0);
+																			RESULT=new Stmt(new Location(startByte,0,startLine,0),Type.FOR_H,"");
+																		:}
+	;
+
+iter_part ::= FOR:e1 identifier IN										{:	
+																			RESULT=new String((String)e1);	
+																		:}
+	;
+
+reverse_opt ::=
+	| REVERSE
+	;
+
+basic_loop ::= LOOP:e1 statement_s END LOOP								{:	
+																			RESULT=new String((String)e1);
+																		:}
+	;
+
+id_opt ::=
+	| designator
+	;
+
+block ::= label_opt block_decl block_body END id_opt SEMI
+	;
+
+block_decl ::= 
+	| DECLARE decl_part
+	;
+
+block_body ::= BEGIN:e1 handled_stmt_s									{: 
+																			RESULT=(String)e1; 
+																		:}
+	;
+
+handled_stmt_s ::= statement_s except_handler_part_opt 
+	; 
+
+except_handler_part_opt ::=
+	| except_handler_part
+	;
+
+exit_stmt ::= EXIT name_opt when_opt SEMI
+	;
+
+name_opt ::=
+	| name
+	;
+
+when_opt ::=
+	| WHEN condition
+	;
+
+return_stmt ::= RETURN SEMI
+	| RETURN expression SEMI
+	;
+
+goto_stmt ::= GOTO name SEMI
+	;
+
+subprog_decl ::= subprog_spec SEMI
+	| generic_subp_inst SEMI
+	| subprog_spec_is_push ABSTRACT SEMI
+	;
+
+subprog_spec ::= PROCEDURE:e1 compound_name formal_part_opt:e2	{:	
+																	getInteger(e1,0);
+																	if (e2 == null){
+																		RESULT = new Stmt(new Location(startByte,-1,startLine,-1),Type.PROC_H,"");
+																	}else{
+																		getInteger(e2,1);
+																		RESULT = new Stmt(new Location(startByte,stopByte,startLine,stopLine),Type.PROC_H,"");
+																	}
+																:}
+																	
+	| FUNCTION:e1 designator formal_part_opt:e2 RETURN:e3 name	{:	
+																	getInteger(e1,0);
+																	if (e2 == null){
+																		getInteger(e3,1);
+																		RESULT = new Stmt(new Location(startByte,stopByte,startLine,stopLine),Type.FUNC_H,"");
+																	}else{
+																		getInteger(e2,1);
+																		RESULT = new Stmt(new Location(startByte,stopByte,startLine,stopLine),Type.FUNC_H,"");
+																	}
+																:}
+																
+	| FUNCTION:e1 designator 								 	{:	
+																	getInteger(e1,0);
+																	RESULT = new Stmt(new Location(startByte,-1,startLine,-1),Type.FUNC_H,""); 
+																:}
+	;
+
+designator ::= compound_name
+	| char_string
+	;
+
+formal_part_opt ::= 											{:	
+																	RESULT=null;					
+																:}	
+																
+	| formal_part:e1											{:	
+																	RESULT=new String((String)e1);
+																:}
+	;
+
+formal_part ::= LPAR:e1 param_s RPAR							{:	
+																	RESULT=new String((String)e1);
+																:}
+	;
+
+param_s ::= param
+	| param_s SEMI param
+	;
+
+param ::= def_id_s COLON mode mark init_opt
+	| error
+	;
+
+mode ::=
+	| IN
+	| OUT
+	| IN OUT
+	| ACCESS
+	;
+
+subprog_spec_is_push ::= subprog_spec:e1 IS:e2					{:	
+																	temp=(Stmt)e1;
+																	getInteger(e2,1);	
+																	int incr;
+																	if (temp.type == Type.FUNC_H)
+																		incr=8;
+																	else
+																		incr=9;
+																		
+																	int stopByte1=0;
+																	if (temp.loc.stopByte == -1){
+																		stopByte1=stopByte;
+																	}else{
+																		stopByte1=temp.loc.stopByte;
+																	}
+																		
+																	RESULT=new Stmt(new Location(temp.loc.startByte,stopByte+2,temp.loc.startLine,stopLine),temp.type,getString(new Location(temp.loc.startByte+incr,stopByte1,0,0)).trim());
+																:}
+	;
+
+subprog_body ::= subprog_spec_is_push:e1
+	       decl_part block_body:e3 END:e4 id_opt SEMI:e5	{:
+																if ( ((Stmt)e1).value.equalsIgnoreCase(mainProc) ){
+																	getInteger(e4,0);
+																	funcLoc=startByte;
+																}
+																startByte=((Stmt)e1).loc.startByte;
+																startLine=((Stmt)e1).loc.startLine;
+																getInteger(e5,1);
+																Type tp=((Stmt)e1).type==Type.PROC_H?Type.PROC:Type.FUNC;
+																temp=new Stmt(new Location(startByte,stopByte+1,startLine,stopLine),tp,getString(new Location(startByte,stopByte+1,0,0)));
+																temp.headers.add(((Stmt)e1));
+																getInteger(e3,0);
+																temp.headers.add(new Stmt(new Location(startByte,startByte+5,startLine,startLine),Type.BLOCK,getString(new Location(startByte,startByte+5,0,0))));
+																elePositions.add(temp);
+															:}
+																
+														
+	;
+
+procedure_call ::= name SEMI
+	;
+
+pkg_decl ::= pkg_spec SEMI
+	| generic_pkg_inst SEMI
+	;
+
+pkg_spec ::= PACKAGE compound_name IS 
+	     decl_item_s private_part END c_id_opt
+	;
+
+private_part ::=
+	| PRIVATE decl_item_s
+	;
+
+c_id_opt ::= 
+	| compound_name
+	;
+
+pkg_body ::= PACKAGE BODY compound_name IS
+	       decl_part body_opt END c_id_opt SEMI
+	;
+
+body_opt ::=
+	| block_body
+	;
+
+private_type ::= tagged_opt limited_opt PRIVATE
+	;
+
+limited_opt ::=
+	| LIMITED
+	;
+
+use_clause ::= USE name_s SEMI
+	| USE TYPE name_s SEMI
+	;
+
+name_s ::= name
+	| name_s COMMA name
+	;
+
+rename_decl ::= def_id_s COLON object_qualifier_opt subtype_ind renames SEMI
+	| def_id_s COLON EXCEPTION renames SEMI
+	| rename_unit
+	;
+
+rename_unit ::= PACKAGE compound_name renames SEMI
+	| subprog_spec renames SEMI
+	| generic_formal_part PACKAGE compound_name renames SEMI
+	| generic_formal_part subprog_spec renames SEMI
+	;
+
+renames ::= RENAMES name
+	;
+
+task_decl ::= task_spec SEMI
+	;
+
+task_spec ::= TASK simple_name task_def
+	| TASK TYPE simple_name discrim_part_opt task_def
+	;
+
+task_def ::=
+	| IS entry_decl_s rep_spec_s task_private_opt END id_opt
+	;
+
+task_private_opt ::=
+	| PRIVATE entry_decl_s rep_spec_s
+	;
+
+task_body ::= TASK BODY simple_name IS
+	       decl_part block_body END id_opt SEMI
+	;
+
+prot_decl ::= prot_spec SEMI
+	;
+
+prot_spec ::= PROTECTED identifier prot_def
+	| PROTECTED TYPE simple_name discrim_part_opt prot_def
+	;
+
+prot_def ::= IS prot_op_decl_s prot_private_opt END id_opt
+	;
+
+prot_private_opt ::=
+	| PRIVATE prot_elem_decl_s 
+	;
+
+prot_op_decl_s ::= 
+	| prot_op_decl_s prot_op_decl
+	;
+
+prot_op_decl ::= entry_decl
+	| subprog_spec SEMI
+	| rep_spec
+	| pragma
+	;
+
+prot_elem_decl_s ::= 
+	| prot_elem_decl_s prot_elem_decl
+	;
+
+prot_elem_decl ::= prot_op_decl | comp_decl ;
+
+prot_body ::= PROTECTED BODY simple_name IS
+	       prot_op_body_s END id_opt SEMI
+	;
+
+prot_op_body_s ::= pragma_s
+	| prot_op_body_s prot_op_body pragma_s
+	;
+
+prot_op_body ::= entry_body
+	| subprog_body
+	| subprog_spec SEMI
+	;
+
+entry_decl_s ::= pragma_s
+	| entry_decl_s entry_decl pragma_s
+	;
+
+entry_decl ::= ENTRY identifier formal_part_opt SEMI
+	| ENTRY identifier LPAR discrete_range RPAR formal_part_opt SEMI
+	;
+
+entry_body ::= ENTRY identifier formal_part_opt WHEN condition entry_body_part
+	| ENTRY identifier LPAR iter_part discrete_range RPAR
+		formal_part_opt WHEN condition entry_body_part
+	;
+
+entry_body_part ::= SEMI
+	| IS decl_part block_body END id_opt SEMI
+	;
+
+rep_spec_s ::=
+	| rep_spec_s rep_spec pragma_s
+	;
+
+entry_call ::= procedure_call
+	;
+
+accept_stmt ::= accept_hdr SEMI
+	| accept_hdr DO handled_stmt_s END id_opt SEMI
+	;
+
+accept_hdr ::= ACCEPT entry_name formal_part_opt
+	;
+
+entry_name ::= simple_name
+	| entry_name LPAR expression RPAR
+	;
+
+delay_stmt ::= DELAY expression SEMI
+	| DELAY UNTIL expression SEMI
+	;
+
+select_stmt ::= select_wait
+	| async_select
+	| timed_entry_call
+	| cond_entry_call
+	;
+
+select_wait ::= SELECT guarded_select_alt or_select else_opt
+	      END SELECT SEMI
+	;
+
+guarded_select_alt ::= select_alt
+	| WHEN condition RIGHT_SHAFT select_alt
+	;
+
+or_select ::=
+	| or_select OR guarded_select_alt
+	;
+
+select_alt ::= accept_stmt stmts_opt
+	| delay_stmt stmts_opt
+	| TERMINATE SEMI
+	;
+
+delay_or_entry_alt ::= delay_stmt stmts_opt
+	| entry_call stmts_opt
+	;
+
+async_select ::= SELECT delay_or_entry_alt
+	       THEN ABORT statement_s
+	       END SELECT SEMI
+	;
+
+timed_entry_call ::= SELECT entry_call stmts_opt 
+		   OR delay_stmt stmts_opt
+	           END SELECT SEMI
+	;
+
+cond_entry_call ::= SELECT entry_call stmts_opt 
+		  ELSE statement_s
+	          END SELECT SEMI
+	;
+
+stmts_opt ::=
+	| statement_s
+	;
+
+abort_stmt ::= ABORT name_s SEMI
+	;
+
+compilation ::=
+	| compilation comp_unit
+	| pragma pragma_s
+	;
+
+comp_unit ::= context_spec private_opt unit pragma_s
+	| private_opt unit pragma_s
+	;
+
+private_opt ::=
+	| PRIVATE
+	;
+
+context_spec ::= with_clause use_clause_opt
+	| context_spec with_clause use_clause_opt
+	| context_spec pragma
+	;
+
+with_clause ::= WITH c_name_list:e1 SEMI:e2				{: 
+															getInteger(e1,0);
+															getInteger(e2,1);
+															String[] s=getString(new Location(startByte,stopByte,0,0)).split(",");
+															for (int i=0;i<s.length;++i){
+																if (s[i].indexOf('.')!=-1)
+																	depPkg.add(s[i].substring(0,s[i].indexOf('.')).trim());
+																else
+																	depPkg.add(s[i].trim());
+															}
+														:}
+																
+	;										
+
+use_clause_opt ::=
+	| use_clause_opt use_clause
+	;
+
+unit ::= pkg_decl
+	| pkg_body
+	| subprog_decl
+	| subprog_body
+	| subunit
+	| generic_decl
+	| rename_unit
+	;
+
+subunit ::= SEPARATE LPAR compound_name RPAR
+	      subunit_body
+	;
+
+subunit_body ::= subprog_body
+	| pkg_body
+	| task_body
+	| prot_body
+	;
+
+body_stub ::= TASK BODY simple_name IS SEPARATE SEMI
+	| PACKAGE BODY compound_name IS SEPARATE SEMI
+	| subprog_spec IS SEPARATE SEMI
+	| PROTECTED BODY simple_name IS SEPARATE SEMI
+	;
+
+exception_decl ::= def_id_s COLON EXCEPTION SEMI
+	;
+
+except_handler_part ::= EXCEPTION exception_handler
+	| except_handler_part exception_handler
+	;
+
+exception_handler ::= WHEN except_choice_s RIGHT_SHAFT statement_s
+	| WHEN identifier COLON except_choice_s RIGHT_SHAFT statement_s
+	;
+
+except_choice_s ::= except_choice
+	| except_choice_s BAR except_choice
+	;
+
+except_choice ::= name
+	| OTHERS
+	;
+
+raise_stmt ::= RAISE name_opt SEMI
+	;
+
+requeue_stmt ::= REQUEUE name SEMI
+	| REQUEUE name WITH ABORT SEMI
+	;
+
+generic_decl ::= generic_formal_part subprog_spec SEMI
+	| generic_formal_part pkg_spec SEMI
+	;
+
+generic_formal_part ::= GENERIC
+	| generic_formal_part generic_formal
+	;
+
+generic_formal ::= param SEMI
+	| TYPE simple_name generic_discrim_part_opt IS generic_type_def SEMI
+	| WITH PROCEDURE simple_name 
+	    formal_part_opt subp_default SEMI
+	| WITH FUNCTION designator 
+	    formal_part_opt RETURN name subp_default SEMI
+	| WITH PACKAGE simple_name IS NEW name LPAR BOX RPAR SEMI
+	| WITH PACKAGE simple_name IS NEW name SEMI
+	| use_clause
+	;
+
+generic_discrim_part_opt ::=
+	| discrim_part
+	| LPAR BOX RPAR
+	;
+
+subp_default ::=
+	| IS name
+	| IS BOX
+	;
+
+generic_type_def ::= LPAR BOX RPAR
+	| RANGE BOX
+	| MOD BOX
+	| DELTA BOX
+	| DELTA BOX DIGITS BOX
+	| DIGITS BOX
+	| array_type
+	| access_type
+	| private_type
+	| generic_derived_type
+	;
+
+generic_derived_type ::= NEW subtype_ind
+	| NEW subtype_ind WITH PRIVATE
+	| ABSTRACT NEW subtype_ind WITH PRIVATE
+	;
+
+generic_subp_inst ::= subprog_spec IS generic_inst
+	;
+
+generic_pkg_inst ::= PACKAGE compound_name IS generic_inst
+	;
+
+generic_inst ::= NEW name
+	;
+
+rep_spec ::= attrib_def
+	| record_type_spec
+	| address_spec
+	;
+
+attrib_def ::= FOR mark USE expression SEMI
+	;
+
+record_type_spec ::= FOR mark USE RECORD align_opt comp_loc_s END RECORD SEMI
+	;
+
+align_opt ::=
+	| AT MOD expression SEMI
+	;
+
+comp_loc_s ::=
+	| comp_loc_s mark AT expression RANGE range SEMI
+	;
+
+address_spec ::= FOR mark USE AT expression SEMI
+	;
+
+code_stmt ::= qualified SEMI
+	;
